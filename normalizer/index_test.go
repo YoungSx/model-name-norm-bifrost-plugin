@@ -1,14 +1,14 @@
 package normalizer
 
 import (
-	"reflect"
 	"sort"
 	"testing"
 )
 
 // sampleModels is the multi-provider registry used across index tests: the same
 // logical model registered under three different naming conventions, plus a few
-// distinct models.
+// distinct models — one of which (claude-4-sonnet / -thinking) exercises the
+// variant-shadowing a single-loose-key index must handle.
 func sampleModels() []ProviderModel {
 	return []ProviderModel{
 		{Provider: "zai", Original: "ZAI/glm-5.2"},
@@ -20,195 +20,232 @@ func sampleModels() []ProviderModel {
 	}
 }
 
-func buildTestIndex(t *testing.T, fuzzy bool) (*Index, []Conflict) {
+func buildTestIndex(t *testing.T, fuzzy bool) *Index {
 	t.Helper()
 	n := New(DefaultConfig())
 	return BuildIndex(n, sampleModels(), fuzzy)
 }
 
+// TestBuildIndex_Canonicalization pins the loose tier: glm-5.2 collapses three
+// providers into one bucket, and the stacked-suffix deepseek keeps "flash".
 func TestBuildIndex_Canonicalization(t *testing.T) {
-	idx, _ := buildTestIndex(t, false)
+	idx := buildTestIndex(t, false)
 
-	// glm-5.2 collapses three providers into one canonical bucket.
-	got, matched, mt := idx.Match("glm-5.2")
-	if mt != MatchExact || matched != "glm-5.2" {
-		t.Fatalf("glm-5.2: got match=%s type=%s, want exact glm-5.2", matched, mt)
+	bucket := idx.loose["glm-5.2"]
+	if len(bucket) != 3 {
+		t.Fatalf("glm-5.2: got %d provider models, want 3: %+v", len(bucket), bucket)
 	}
-	if len(got) != 3 {
-		t.Fatalf("glm-5.2: got %d provider models, want 3: %+v", len(got), got)
-	}
-
-	// deepseek-v4-flash keeps the non-suffix "flash" token but drops "fast".
-	if _, _, mt := idx.Match("deepseek-v4-flash"); mt != MatchExact {
-		t.Fatalf("deepseek-v4-flash: want exact match, got %s", mt)
+	if len(idx.loose["deepseek-v4-flash"]) != 1 {
+		t.Fatalf("deepseek-v4-flash should be one entry, got %+v", idx.loose["deepseek-v4-flash"])
 	}
 }
 
+// TestBuildIndex_ConflictDetection verifies the cross-provider canonical is
+// reported, and that anthropic's two models (base + thinking) are reported as a
+// single-provider shadowing rather than a second cross-provider conflict.
 func TestBuildIndex_ConflictDetection(t *testing.T) {
-	_, conflicts := buildTestIndex(t, false)
+	idx := buildTestIndex(t, false)
 
-	if len(conflicts) != 1 {
-		t.Fatalf("got %d conflicts, want 1: %+v", len(conflicts), conflicts)
+	conflicts := idx.Conflicts()
+	var multi []Conflict
+	for _, c := range conflicts {
+		if len(c.Providers) > 1 {
+			multi = append(multi, c)
+		}
 	}
-	c := conflicts[0]
+	if len(multi) != 1 {
+		t.Fatalf("got %d cross-provider conflicts, want 1: %+v", len(multi), conflicts)
+	}
+	c := multi[0]
 	if c.Canonical != "glm-5.2" {
 		t.Fatalf("conflict canonical = %q, want glm-5.2", c.Canonical)
 	}
 	got := append([]string(nil), c.Providers...)
 	sort.Strings(got)
 	want := []string{"openrouter", "zai", "zhipu"}
-	if !reflect.DeepEqual(got, want) {
+	if !equalStrings(got, want) {
 		t.Fatalf("conflict providers = %v, want %v", got, want)
 	}
+
+	// anthropic base + variant must surface as a shadowing warning, not a second
+	// cross-provider conflict.
+	var shadow []Conflict
+	for _, cc := range conflicts {
+		if len(cc.Shadowed) > 0 {
+			shadow = append(shadow, cc)
+		}
+	}
+	if len(shadow) != 1 || shadow[0].Canonical != "claude-4-sonnet" {
+		t.Fatalf("expected one shadowing conflict on claude-4-sonnet, got %+v", shadow)
+	}
+	if shadow[0].Shadowed[0] != "claude-4-sonnet-thinking" {
+		t.Fatalf("expected thinking to be shadowed, got %v", shadow[0].Shadowed)
+	}
 }
 
-func TestBuildIndex_SameProviderNoConflict(t *testing.T) {
+// TestBuildIndex_SameProviderDuplicateSpelling must NOT be a conflict: one
+// provider registering two spellings of the same model (same strict key) is a
+// legit alias load-balancing setup, flagged only as benign dedup.
+func TestBuildIndex_SameProviderDuplicateSpelling(t *testing.T) {
 	n := New(DefaultConfig())
-	// One provider registering two spellings of the same model must not be
-	// reported as a cross-provider conflict.
 	models := []ProviderModel{
 		{Provider: "zai", Original: "GLM_5_2"},
-		{Provider: "zai", Original: "glm-5-2"},
+		{Provider: "zai", Original: "glm-5-2"}, // same strict key after version norm
 	}
-	_, conflicts := BuildIndex(n, models, false)
-	if len(conflicts) != 0 {
-		t.Fatalf("same-provider duplicates should not conflict, got %+v", conflicts)
-	}
-}
-
-func TestMatch_ExactMissWithoutFuzzy(t *testing.T) {
-	idx, _ := buildTestIndex(t, false)
-
-	// A suffixed request that isn't itself an index key must miss when fuzzy is off.
-	if _, _, mt := idx.Match("glm-5.2-turbo"); mt != MatchNone {
-		t.Fatalf("glm-5.2-turbo without fuzzy: want none, got %s", mt)
+	idx := BuildIndex(n, models, false)
+	for _, c := range idx.Conflicts() {
+		if c.Canonical == "glm-5.2" {
+			t.Fatalf("duplicate spelling of one model should not conflict, got %+v", c)
+		}
 	}
 }
 
-func TestMatch_FuzzySuffixDifference(t *testing.T) {
-	idx, _ := buildTestIndex(t, true)
-
-	// Request lacks the "-thinking" suffix that the registered model carries;
-	// fuzzy segment-prefix should still resolve it. (Both normalize into the
-	// index: claude-4-sonnet and claude-4-sonnet-thinking.)
-	models, matched, mt := idx.Match("claude-4-sonnet-instruct")
-	if mt != MatchFuzzy {
-		t.Fatalf("claude-4-sonnet-instruct: want fuzzy, got %s", mt)
+// TestResolveForProvider_StrictWinsRotationBack is the regression for the variant
+// collapse: an explicit request for the thinking variant must resolve to it,
+// even though the loose key is shared with the base model that was registered
+// first.
+func TestResolveForProvider_StrictWinsVariant(t *testing.T) {
+	idx := buildTestIndex(t, false)
+	res := idx.ResolveForProvider("claude-4-sonnet-thinking", "anthropic")
+	if !res.OK() || res.Type != MatchStrict {
+		t.Fatalf("variant: ok=%v type=%s, want strict hit", res.OK(), res.Type)
 	}
-	if matched != "claude-4-sonnet" {
-		t.Fatalf("fuzzy matched %q, want claude-4-sonnet", matched)
+	if res.Model.Original != "claude-4-sonnet-thinking" {
+		t.Fatalf("variant resolved to %q, want claude-4-sonnet-thinking", res.Model.Original)
 	}
-	if len(models) == 0 {
-		t.Fatalf("fuzzy match returned no provider models")
-	}
-}
 
-func TestMatch_FuzzyRejectsVersionMismatch(t *testing.T) {
-	idx, _ := buildTestIndex(t, true)
-
-	// The PRD explicitly forbids matching across a version/segment difference:
-	// claude-5-sonnet must never resolve to claude-4-sonnet.
-	if _, matched, mt := idx.Match("claude-5-sonnet"); mt != MatchNone {
-		t.Fatalf("claude-5-sonnet: want none, got %s (matched %q)", mt, matched)
+	// A bare canonical request still gets the base model (first registered).
+	res = idx.ResolveForProvider("claude-4-sonnet", "anthropic")
+	if res.Model.Original != "Claude-4-Sonnet" {
+		t.Fatalf("base canonical resolved to %q, want Claude-4-Sonnet", res.Model.Original)
 	}
 }
 
-func TestMatch_FuzzyDeterministicClosest(t *testing.T) {
+// TestResolveForProvider_CrossSpellingAliasResolution is the PRD headline: an
+// arbitrary spelling finds the target provider's registered name. Each of the
+// three glm spellings resolves to its own provider's original.
+func TestResolveForProvider_CrossSpellingAliasResolution(t *testing.T) {
+	idx := buildTestIndex(t, false)
+	cases := []struct {
+		provider, in, want string
+	}{
+		{"zai", "GLM_5_2", "ZAI/glm-5.2"},
+		{"zhipu", "glm 5 2", "智谱/GLM_5_2"},
+		{"openrouter", "glm-5.2:free", "glm 5 2:free"},
+		{"deepseek", "deepseek-ai/deepseek-v4-flash-fast", "deepseek-ai/DeepSeek-V4-Flash-fast"},
+	}
+	for _, c := range cases {
+		res := idx.ResolveForProvider(c.in, c.provider)
+		if !res.OK() || res.Model.Original != c.want {
+			t.Fatalf("ResolveForProvider(%q,%q) = %+v, want %q", c.in, c.provider, res, c.want)
+		}
+	}
+}
+
+// TestResolveForProvider_NotInBucketMiss: the canonical exists but not for this
+// provider — must miss so the request is left untouched.
+func TestResolveForProvider_NotInBucketMiss(t *testing.T) {
+	idx := buildTestIndex(t, false)
+	// glm-5.2 has zai/zhipu/openrouter, not anthropic.
+	if res := idx.ResolveForProvider("glm-5.2", "anthropic"); res.OK() {
+		t.Fatal("glm-5.2 for anthropic should miss")
+	}
+}
+
+// TestResolveForProvider_AbsentMiss and the empty model guard.
+func TestResolveForProvider_AbsentMiss(t *testing.T) {
+	idx := buildTestIndex(t, false)
+	if res := idx.ResolveForProvider("does-not-exist", "zai"); res.OK() {
+		t.Fatal("absent canonical should miss")
+	}
+	if res := idx.ResolveForProvider("", "zai"); res.OK() {
+		t.Fatal("empty model should miss")
+	}
+	if res := idx.ResolveForProvider("   ", "zai"); res.OK() {
+		t.Fatal("whitespace model should miss")
+	}
+}
+
+// TestResolveForProvider_FuzzyScopedToProvider is the regression guard for the
+// provider-scoped fuzzy rule. Two providers offer segment-prefix candidates for
+// "gpt-5-mini": p1's "gpt-5" (gap 1) and p2's "gpt-5-mini-preview" (gap 1). The
+// global-best key is "gpt-5", which belongs to p1. A naive "pick global best,
+// then filter by provider" implementation would report a false miss for p2.
+func TestResolveForProvider_FuzzyScopedToProvider(t *testing.T) {
 	n := New(DefaultConfig())
-	// Two candidates share the request's segment prefix; the one with the
-	// smaller segment-count gap must win deterministically.
 	models := []ProviderModel{
 		{Provider: "p1", Original: "gpt-5"},
 		{Provider: "p2", Original: "gpt-5-mini-preview"},
 	}
-	idx, _ := BuildIndex(n, models, true)
+	idx := BuildIndex(n, models, true)
 
-	_, matched, mt := idx.Match("gpt-5-mini")
-	if mt != MatchFuzzy {
-		t.Fatalf("gpt-5-mini: want fuzzy, got %s", mt)
+	res := idx.ResolveForProvider("gpt-5-mini", "p2")
+	if !res.OK() || res.Type != MatchFuzzy || res.Model.Original != "gpt-5-mini-preview" {
+		t.Fatalf("p2 gpt-5-mini: %+v, want fuzzy gpt-5-mini-preview", res)
 	}
-	// gpt-5-mini vs gpt-5 (gap 1) vs gpt-5-mini-preview (gap 1): tie broken
-	// lexicographically → gpt-5 sorts before gpt-5-mini-preview... but gpt-5 is
-	// a prefix (gap 1) and gpt-5-mini-preview is also gap 1. Lexical first wins.
-	if matched != "gpt-5" {
-		t.Fatalf("fuzzy tie-break matched %q, want gpt-5", matched)
+	res = idx.ResolveForProvider("gpt-5-mini", "p1")
+	if !res.OK() || res.Model.Original != "gpt-5" {
+		t.Fatalf("p1 gpt-5-mini: %+v, want gpt-5", res)
+	}
+	if res := idx.ResolveForProvider("gpt-5-mini", "p3"); res.OK() {
+		t.Fatal("p3 has no candidate; must miss")
 	}
 }
 
+// TestResolveForProvider_FuzzyRejectsVersionMismatch: claude-5-sonnet must never
+// resolve to claude-4-sonnet.
+func TestResolveForProvider_FuzzyRejectsVersionMismatch(t *testing.T) {
+	idx := buildTestIndex(t, true)
+	if res := idx.ResolveForProvider("claude-5-sonnet", "anthropic"); res.OK() {
+		t.Fatalf("claude-5-sonnet should miss, got %+v", res)
+	}
+}
+
+// TestResolveForProvider_FuzzyDisabled by default.
+func TestResolveForProvider_FuzzyDisabled(t *testing.T) {
+	idx := buildTestIndex(t, false)
+	if res := idx.ResolveForProvider("claude-4-sonnet-instruct", "anthropic"); res.OK() {
+		t.Fatalf("fuzzy-off miss should not resolve, got %+v", res)
+	}
+}
+
+// TestBuildIndex_SkipsUnroutableNames documents the build-time hygiene that
+// matches ModelsFromAccount: blank names and the whitelist wildcard `*` are not
+// models and must never become index keys.
+func TestBuildIndex_SkipsUnroutableNames(t *testing.T) {
+	n := New(DefaultConfig())
+	models := []ProviderModel{
+		{Provider: "zai", Original: "*"},
+		{Provider: "zai", Original: "  "},
+		{Provider: "zai", Original: "glm-5.2"},
+	}
+	idx := BuildIndex(n, models, false)
+	if idx.Len() != 1 {
+		t.Fatalf("expected 1 canonical (glm-5.2), got %d", idx.Len())
+	}
+	if _, ok := idx.loose["*"]; ok {
+		t.Fatal("wildcard '*' must never be indexed as a model")
+	}
+}
+
+// TestIndex_Len pins the documented distinct-canonical count for the sample.
 func TestIndex_Len(t *testing.T) {
-	idx, _ := buildTestIndex(t, false)
-	// Distinct canonicals: glm-5.2 (zai+zhipu+openrouter), claude-4-sonnet
-	// (Claude-4-Sonnet and claude-4-sonnet-thinking both collapse here, since
-	// "thinking" is a stripped dash-token), and deepseek-v4-flash = 3.
+	idx := buildTestIndex(t, false)
+	// glm-5.2 (zai+zhipu+openrouter), claude-4-sonnet (base + thinking),
+	// deepseek-v4-flash = 3.
 	if idx.Len() != 3 {
 		t.Fatalf("index length = %d, want 3", idx.Len())
 	}
 }
 
-func TestMatchForProvider_DisambiguatesConflict(t *testing.T) {
-	idx, _ := buildTestIndex(t, false)
-
-	// glm-5.2 is a shared canonical (zai, zhipu, openrouter). A request targeting
-	// one provider must resolve to that provider's own registered spelling.
-	pm, matched, mt, ok := idx.MatchForProvider("glm-5.2", "zhipu")
-	if !ok || mt != MatchExact || matched != "glm-5.2" {
-		t.Fatalf("zhipu glm-5.2: ok=%v type=%s matched=%q, want exact glm-5.2", ok, mt, matched)
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	if pm.Provider != "zhipu" || pm.Original != "智谱/GLM_5_2" {
-		t.Fatalf("resolved %+v, want provider=zhipu original=智谱/GLM_5_2", pm)
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
-}
-
-func TestMatchForProvider_ProviderNotInBucket(t *testing.T) {
-	idx, _ := buildTestIndex(t, false)
-
-	// The canonical exists, but not for this provider: must miss so the caller
-	// leaves the request untouched.
-	if _, _, _, ok := idx.MatchForProvider("glm-5.2", "anthropic"); ok {
-		t.Fatal("glm-5.2 for anthropic should miss: no anthropic entry in that bucket")
-	}
-}
-
-func TestMatchForProvider_Miss(t *testing.T) {
-	idx, _ := buildTestIndex(t, false)
-
-	if _, _, _, ok := idx.MatchForProvider("does-not-exist", "zai"); ok {
-		t.Fatal("absent canonical should miss")
-	}
-}
-
-// TestMatchForProvider_FuzzyScopedToProvider is the regression guard for the
-// provider-scoped fuzzy rule. Two providers offer segment-prefix candidates for
-// "gpt-5-mini": p1's "gpt-5" (gap 1) and p2's "gpt-5-mini-preview" (gap 1). The
-// global-best key is "gpt-5" (lexicographically first), which belongs to p1. A
-// naive "pick global best, then filter by provider" implementation would report
-// a false miss for p2 — even though p2 has a perfectly good fuzzy candidate.
-// Provider-scoped selection must resolve p2 to its own "gpt-5-mini-preview".
-func TestMatchForProvider_FuzzyScopedToProvider(t *testing.T) {
-	n := New(DefaultConfig())
-	models := []ProviderModel{
-		{Provider: "p1", Original: "gpt-5"},
-		{Provider: "p2", Original: "gpt-5-mini-preview"},
-	}
-	idx, _ := BuildIndex(n, models, true)
-
-	// p2 must resolve within its own candidates, not be shadowed by p1's closer key.
-	pm, matched, mt, ok := idx.MatchForProvider("gpt-5-mini", "p2")
-	if !ok || mt != MatchFuzzy {
-		t.Fatalf("p2 gpt-5-mini: ok=%v type=%s, want fuzzy hit", ok, mt)
-	}
-	if matched != "gpt-5-mini-preview" || pm.Original != "gpt-5-mini-preview" {
-		t.Fatalf("p2 resolved to matched=%q original=%q, want gpt-5-mini-preview", matched, pm.Original)
-	}
-
-	// p1 still resolves to its own "gpt-5".
-	pm, matched, _, ok = idx.MatchForProvider("gpt-5-mini", "p1")
-	if !ok || matched != "gpt-5" || pm.Original != "gpt-5" {
-		t.Fatalf("p1 gpt-5-mini: ok=%v matched=%q original=%q, want gpt-5", ok, matched, pm.Original)
-	}
-
-	// A provider with no candidate at all still misses.
-	if _, _, _, ok := idx.MatchForProvider("gpt-5-mini", "p3"); ok {
-		t.Fatal("p3 has no candidate; must miss")
-	}
+	return true
 }

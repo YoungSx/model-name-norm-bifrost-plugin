@@ -21,9 +21,9 @@ type Result struct {
 	Canonical string
 	// Original is the untouched input, preserved for logging and diagnostics.
 	Original string
-	// EmptyFallback is true when suffix stripping consumed the entire name and
-	// the pipeline fell back to the pre-suffix value to avoid emitting an empty
-	// canonical. Callers should emit a warning when this is set.
+	// EmptyFallback is true when the pipeline would have emitted an empty
+	// canonical and fell back to a non-empty earlier value instead. Callers
+	// should emit a warning when this is set.
 	EmptyFallback bool
 }
 
@@ -53,10 +53,11 @@ func New(cfg Config) *Normalizer {
 	return &Normalizer{cfg: cfg, separator: sep, tokenSet: tokens}
 }
 
-// Normalize runs the full pipeline and returns the canonical name. Stages are
-// ordered so each operates on the output of the previous: prefix stripping sees
-// the original casing, suffix and version rules see the already-unified
-// separator form.
+// Normalize runs the full pipeline, including suffix stripping, and returns the
+// loose canonical name: the key under which every marketing/capability variant
+// of one logical model collapses together (`claude-4-sonnet-thinking` and
+// `Claude-4-Sonnet` both yield `claude-4-sonnet`). This is what lets a caller's
+// arbitrary spelling find a provider's registered model.
 //
 // Note on ordering: the PRD lists version normalization (step 5) before suffix
 // stripping (step 6), but its own canonical example `glm 5 2:free` → `glm-5.2`
@@ -67,6 +68,31 @@ func New(cfg Config) *Normalizer {
 // core invariant that one logical model yields one canonical form regardless of
 // which marketing/capability suffixes were attached.
 func (n *Normalizer) Normalize(original string) Result {
+	return n.normalize(original, true)
+}
+
+// NormalizeStrict runs the pipeline with every suffix rule disabled, collapsing
+// only cosmetic differences: surrounding whitespace, provider prefix, letter
+// case, separator spelling and numeric-version punctuation.
+//
+// Strict canonicalization is what keeps distinct models distinct. Suffix
+// stripping is deliberately lossy — it maps a family of names onto one key — so
+// using it alone would make an explicit request for `claude-4-sonnet-thinking`
+// indistinguishable from one for `claude-4-sonnet`, and a provider that
+// registered both would always be handed the base model. The strict key
+// preserves the caller's intent (`claude-4-sonnet-thinking` stays itself) while
+// still absorbing spelling noise (`Claude 4 Sonnet Thinking` maps to the same
+// strict key). Index lookups try strict first and only fall back to the loose
+// key, so variant fidelity wins whenever the provider actually offers the
+// variant. See Index.ResolveForProvider.
+func (n *Normalizer) NormalizeStrict(original string) Result {
+	return n.normalize(original, false)
+}
+
+// normalize is the shared pipeline. stripSuffixes selects the loose (true) or
+// strict (false) variant; every other stage is identical, so the two keys can
+// never disagree about casing, prefixes or separators.
+func (n *Normalizer) normalize(original string, stripSuffixes bool) Result {
 	s := original
 
 	// 1. Trim surrounding whitespace and invisible characters.
@@ -91,16 +117,19 @@ func (n *Normalizer) Normalize(original string) Result {
 		s = strings.Trim(s, n.separator)
 	}
 
-	// 5. Suffix stripping (colon → bracket → dash-token). The pre-suffix value
-	//    is retained for empty protection.
-	preSuffix := s
-	s = n.stripSuffixes(s)
-
-	// 6. Empty protection: never emit an empty canonical; fall back to the
-	//    pre-suffix value (or the trimmed original as a last resort) and flag it.
-	//    Checked before version normalization since version on an empty/fallback
-	//    value is meaningless.
 	res := Result{Original: original}
+
+	// 5. Suffix stripping (colon → bracket → dash-token), loose mode only. The
+	//    pre-suffix value is retained for empty protection.
+	preSuffix := s
+	if stripSuffixes {
+		s = n.stripSuffixes(s)
+	}
+
+	// 6. Empty protection: never emit an empty canonical when a non-empty
+	//    earlier value exists. Checked before version normalization since
+	//    version on an empty value is meaningless. Prefix stripping alone can
+	//    empty the name (input `a/`), so this applies in strict mode too.
 	if s == "" {
 		fallback := preSuffix
 		if fallback == "" {

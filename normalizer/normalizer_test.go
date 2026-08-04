@@ -9,7 +9,7 @@ func newDefault() *Normalizer {
 }
 
 // TestPRDTables walks every worked example and acceptance-table row from the PRD
-// so the pipeline is pinned to the spec exactly.
+// so the loose pipeline (Normalize, with suffix stripping) is pinned to the spec.
 func TestPRDTables(t *testing.T) {
 	n := newDefault()
 	cases := []struct {
@@ -69,6 +69,34 @@ func TestPRDTables(t *testing.T) {
 	}
 }
 
+// TestStrictKeepsVariants is the core behavior the strict tier exists for: an
+// explicit capability variant must stay itself, while every cosmetic difference
+// still collapses. The thinking variant and the base model share one loose
+// canonical but must have distinct strict keys.
+func TestStrictKeepsVariants(t *testing.T) {
+	n := newDefault()
+	looseBase := n.Normalize("Claude-4-Sonnet")
+	looseVariant := n.Normalize("claude-4-sonnet-thinking")
+	strictBase := n.NormalizeStrict("Claude-4-Sonnet")
+	strictVariant := n.NormalizeStrict("claude-4-sonnet-thinking")
+
+	if looseBase.Canonical != looseVariant.Canonical {
+		t.Fatalf("loose should collapse variants: base=%q variant=%q",
+			looseBase.Canonical, looseVariant.Canonical)
+	}
+	if strictBase.Canonical == strictVariant.Canonical {
+		t.Fatalf("strict must keep variants apart: base=%q variant=%q",
+			strictBase.Canonical, strictVariant.Canonical)
+	}
+	if strictVariant.Canonical != "claude-4-sonnet-thinking" {
+		t.Fatalf("strict variant = %q, want claude-4-sonnet-thinking", strictVariant.Canonical)
+	}
+	// Cosmetic noise still collapses under strict: spacing/case must not matter.
+	if g := n.NormalizeStrict("Claude 4 Sonnet Thinking").Canonical; g != "claude-4-sonnet-thinking" {
+		t.Fatalf("strict should still collapse cosmetic noise: got %q", g)
+	}
+}
+
 // TestEmptyProtection covers section 6.7: a name consisting entirely of a
 // stripped suffix must fall back to the pre-suffix value and flag it.
 func TestEmptyProtection(t *testing.T) {
@@ -124,12 +152,16 @@ func TestVersionMultiSegment(t *testing.T) {
 }
 
 // TestStagesDisabled confirms every stage is opt-out: with a zero Config the
-// pipeline only trims (all normalization flags default false).
+// pipeline only trims (all normalization flags default false). Loose and strict
+// are identical when no suffix stage runs.
 func TestStagesDisabled(t *testing.T) {
 	n := New(Config{})
-	got := n.Normalize("  ZAI/GLM_5_2:free  ")
-	if got.Canonical != "ZAI/GLM_5_2:free" {
-		t.Fatalf("with all stages off, only trim should apply; got %q", got.Canonical)
+	want := "ZAI/GLM_5_2:free"
+	if got := n.Normalize("  ZAI/GLM_5_2:free  ").Canonical; got != want {
+		t.Fatalf("loose with all stages off should only trim; got %q", got)
+	}
+	if got := n.NormalizeStrict("  ZAI/GLM_5_2:free  ").Canonical; got != want {
+		t.Fatalf("strict with all stages off should only trim; got %q", got)
 	}
 }
 
@@ -137,13 +169,25 @@ func TestStagesDisabled(t *testing.T) {
 // Normalizer shared across goroutines must be race-free (run with -race).
 func TestConcurrentUse(t *testing.T) {
 	n := newDefault()
-	done := make(chan string, 8)
-	for i := 0; i < 8; i++ {
-		go func() { done <- n.Normalize("ZAI/GLM_5_2").Canonical }()
+	const workers = 8
+	done := make(chan string, workers*2)
+	for i := 0; i < workers; i++ {
+		go func() {
+			done <- n.Normalize("ZAI/GLM_5_2").Canonical
+			done <- n.NormalizeStrict("claude-4-sonnet-thinking").Canonical
+		}()
 	}
-	for i := 0; i < 8; i++ {
-		if got := <-done; got != "glm-5.2" {
-			t.Fatalf("concurrent Normalize got %q, want glm-5.2", got)
-		}
+	// A buffered channel does not interleave producers, so verify the multiset of
+	// results rather than assuming an alternating order.
+	counts := map[string]int{}
+	for i := 0; i < workers*2; i++ {
+		counts[<-done]++
+	}
+	if counts["glm-5.2"] != workers {
+		t.Fatalf("concurrent Normalize: %d glm-5.2, want %d", counts["glm-5.2"], workers)
+	}
+	if counts["claude-4-sonnet-thinking"] != workers {
+		t.Fatalf("concurrent NormalizeStrict: %d thinking, want %d",
+			counts["claude-4-sonnet-thinking"], workers)
 	}
 }

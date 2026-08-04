@@ -30,15 +30,28 @@ var _ ModelSource = (schemas.Account)(nil)
 // the plugin's startup index (PRD section 8) is built from whatever models the
 // providers' keys declare.
 //
+// Only names that could legitimately be a rewrite target are collected, mirroring
+// the eligibility rules Bifrost itself applies when selecting a key
+// (`key.Models.IsAllowed(model) && !key.BlacklistedModels.IsBlocked(model)`):
+//
+//   - A disabled key contributes nothing.
+//   - The `*` wildcard is skipped. In Key.Models it means "any model is allowed"
+//     (schemas.WhiteList.IsUnrestricted), not a model literally named `*`; a
+//     provider configured that way accepts the caller's name as-is and needs no
+//     rewriting. Indexing `*` would let a request be rewritten to `"*"`.
+//   - A model blacklisted on the same key is skipped: rewriting a request to a
+//     name that key refuses to serve would turn a working request into a routing
+//     failure.
+//
 // Model names are de-duplicated per provider (the same model may appear across
 // several keys for load-balancing) so a provider contributes each spelling once,
 // preserving first-seen order for deterministic index buckets and logs.
 //
-// A provider whose keys enumerate no models contributes nothing rather than
-// failing: many providers accept any model name and leave Key.Models empty, and
-// such a provider simply isn't matchable until it declares its catalogue. Errors
-// from the account are surfaced (wrapped) so a genuine configuration failure at
-// startup is not silently swallowed.
+// A provider whose keys enumerate no eligible models contributes nothing rather
+// than failing: many providers accept any model name, and such a provider simply
+// isn't matchable until it declares its catalogue. Errors from the account are
+// surfaced (wrapped) so a genuine configuration failure at startup is not
+// silently swallowed.
 func ModelsFromAccount(ctx context.Context, src ModelSource) ([]normalizer.ProviderModel, error) {
 	if src == nil {
 		return nil, nil
@@ -56,8 +69,14 @@ func ModelsFromAccount(ctx context.Context, src ModelSource) ([]normalizer.Provi
 		}
 		seen := make(map[string]struct{})
 		for _, k := range keys {
+			if k.Enabled != nil && !*k.Enabled {
+				continue
+			}
 			for _, name := range k.Models {
-				if name == "" {
+				if name == "" || name == "*" {
+					continue
+				}
+				if k.BlacklistedModels.IsBlocked(name) {
 					continue
 				}
 				if _, dup := seen[name]; dup {
@@ -78,6 +97,21 @@ func ModelsFromAccount(ctx context.Context, src ModelSource) ([]normalizer.Provi
 // models (ModelsFromAccount) and builds the plugin over them. Use it when wiring
 // the plugin into a live Bifrost instance; use New directly in tests or when the
 // model set is already known.
+//
+// The resulting plugin goes straight into schemas.BifrostConfig.LLMPlugins:
+//
+//	p, err := plugin.NewFromAccount(ctx, plugin.DefaultConfig(), account, logger)
+//	if err != nil { return err }
+//	bf, err := bifrost.Init(ctx, schemas.BifrostConfig{
+//	    Account:    account,
+//	    LLMPlugins: []schemas.LLMPlugin{p},
+//	    Logger:     logger,
+//	})
+//
+// The index is a snapshot of the account at construction time. Bifrost can gain
+// providers, keys and models at runtime; those are not reflected until the plugin
+// is rebuilt, and a request for a model added later simply misses and is
+// forwarded verbatim (never rewritten to something stale).
 func NewFromAccount(ctx context.Context, cfg Config, src ModelSource, logger schemas.Logger) (*Plugin, error) {
 	models, err := ModelsFromAccount(ctx, src)
 	if err != nil {
