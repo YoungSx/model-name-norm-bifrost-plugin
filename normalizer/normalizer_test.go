@@ -45,6 +45,7 @@ func TestPRDTables(t *testing.T) {
 		// Section 6.6 suffixes.
 		{"colon free", "glm-5.2:free", "glm-5.2"},
 		{"colon date", "gpt-5:2025", "gpt-5"},
+		{"colon multi-segment", "provider:model:free", "provider:model"},
 		{"dash thinking", "claude-4-sonnet-thinking", "claude-4-sonnet"},
 		{"flash preserved", "deepseek-v4-flash", "deepseek-v4-flash"},
 		{"flash-fast stripped", "deepseek-v4-flash-fast", "deepseek-v4-flash"},

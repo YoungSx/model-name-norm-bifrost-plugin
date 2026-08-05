@@ -186,9 +186,9 @@ func (n *Normalizer) normalizeVersion(s string) string {
 // segment), then bracket removal (which can expose a new trailing token), then
 // repeated dash-token removal.
 func (n *Normalizer) stripSuffixes(s string) string {
-	// A. Colon suffix: everything from the first ':' onward is dropped.
+	// A. Colon suffix: everything from the last colon onward is dropped. Using the last colon (not the first) preserves any namespace-style colons in the model name itself (e.g. provider:model:free -> provider:model) while still stripping the trailing free-form suffix the PRD targets (glm-5.2:free -> glm-5.2)
 	if n.cfg.Suffix.Colon.Enabled {
-		if i := strings.Index(s, ":"); i >= 0 {
+		if i := strings.LastIndex(s, ":"); i >= 0 {
 			s = s[:i]
 		}
 	}
